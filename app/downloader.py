@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Literal
+import shutil
 
 import yt_dlp
 
+from .config import MP3_BITRATE_KBPS
 
 StatusCb = Callable[[str], None]
 ProgressCb = Callable[[float], None]  # 0.0 .. 100.0
+
+OutputFormat = Literal["best", "mp3"]
 
 
 @dataclass
@@ -21,7 +25,9 @@ class DownloadResult:
 class AudioDownloader:
     """
     Downloads the best available audio stream from a YouTube URL.
-    Uses yt-dlp only (no ffmpeg) and writes to out_dir.
+
+    - output_format="best": saves best audio stream (no ffmpeg needed)
+    - output_format="mp3": converts to mp3 via ffmpeg (ffmpeg required)
     """
 
     def __init__(
@@ -33,37 +39,64 @@ class AudioDownloader:
         self.out_dir = out_dir
         self.status_cb = status_cb
         self.progress_cb = progress_cb
-
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-    def download_best_audio(self, url: str) -> DownloadResult:
-        ydl_opts = self._build_ydl_opts()
+    def download_audio(self, url: str, output_format: OutputFormat = "best") -> DownloadResult:
+        if output_format == "mp3":
+            self._ensure_ffmpeg_available()
+
+        ydl_opts = self._build_ydl_opts(output_format)
 
         self._emit_status("Preparing download…")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
         title = info.get("title", "output")
-        ext = info.get("ext", "webm")
         video_id = info.get("id", "unknown")
+        if output_format == "mp3":
+            ext = "mp3"
+        else:
+            ext = info.get("ext", "webm")
+
         file_path = self.out_dir / f"{title} [{video_id}].{ext}"
 
         self._emit_status("Done.")
         self._emit_progress(100.0)
         return DownloadResult(file_path=file_path, title=title, ext=ext)
 
-    def _build_ydl_opts(self) -> dict:
+    def _build_ydl_opts(self, output_format: OutputFormat) -> dict:
         outtmpl = str(self.out_dir / "%(title)s [%(id)s].%(ext)s")
 
-        return {
+        opts: dict = {
             "format": "bestaudio/best",
             "outtmpl": outtmpl,
             "noplaylist": True,
             "windowsfilenames": True,
-            "quiet": True,          # keep console clean; we’ll show messages in UI
+            "quiet": True,
             "no_warnings": True,
             "progress_hooks": [self._progress_hook],
         }
+
+        if output_format == "mp3":
+            opts["postprocessors"] = [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": str(MP3_BITRATE_KBPS),  # e.g. "320"
+                }
+            ]
+
+        return opts
+
+    def _ensure_ffmpeg_available(self) -> None:
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            raise RuntimeError(
+                "FFmpeg is required for MP3 conversion but was not found on PATH.\n\n"
+                "Install FFmpeg and ensure 'ffmpeg' and 'ffprobe' are available in your terminal.\n"
+                "Then restart the app."
+            )
 
     def _progress_hook(self, d: dict) -> None:
         status = d.get("status")

@@ -3,12 +3,18 @@ from __future__ import annotations
 import threading
 import queue
 from dataclasses import dataclass
-from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from .config import APP_TITLE, DEFAULT_OUTPUT_DIR, WINDOW_MIN_SIZE, POLL_MS
-from .downloader import AudioDownloader, DownloadResult
+from .config import (
+    APP_TITLE,
+    DEFAULT_OUTPUT_DIR,
+    WINDOW_MIN_SIZE,
+    POLL_MS,
+    OUTPUT_FORMATS,
+    DEFAULT_OUTPUT_FORMAT,
+)
+from .downloader import AudioDownloader, DownloadResult, OutputFormat
 
 
 @dataclass
@@ -34,7 +40,7 @@ class App(tk.Tk):
 
         self.header = ttk.Label(
             self.main,
-            text="YouTube → Best Audio Downloader",
+            text="YouTube → Audio Downloader",
             font=("Segoe UI", 14, "bold"),
         )
 
@@ -42,29 +48,58 @@ class App(tk.Tk):
         self.url_var = tk.StringVar()
         self.url_entry = ttk.Entry(self.main, textvariable=self.url_var)
         self.url_entry.focus_set()
-        self.convert_btn = ttk.Button(self.main, text="Download audio", command=self.on_convert_clicked)
+
+        # NEW: output format dropdown
+        self.format_label = ttk.Label(self.main, text="Format:")
+        self.format_var = tk.StringVar(value=DEFAULT_OUTPUT_FORMAT)
+
+        # Map label -> internal value
+        self._format_label_to_value = {label: value for (label, value) in OUTPUT_FORMATS}
+        self._format_value_to_label = {value: label for (label, value) in OUTPUT_FORMATS}
+
+        self.format_combo = ttk.Combobox(
+            self.main,
+            state="readonly",
+            values=[label for (label, _v) in OUTPUT_FORMATS],
+        )
+        self.format_combo.set(self._format_value_to_label[DEFAULT_OUTPUT_FORMAT])
+
+        self.convert_btn = ttk.Button(self.main, text="Download", command=self.on_convert_clicked)
+
         self.progress = ttk.Progressbar(self.main, orient="horizontal", mode="determinate", maximum=100)
         self.status_var = tk.StringVar(value="Ready.")
         self.status_label = ttk.Label(self.main, textvariable=self.status_var)
+
         self.log = tk.Text(self.main, height=10, wrap="word", state="disabled")
         self.log_scroll = ttk.Scrollbar(self.main, command=self.log.yview)
         self.log.configure(yscrollcommand=self.log_scroll.set)
+
         self.bind("<Return>", lambda _e: self.on_convert_clicked())
 
     def _layout_widgets(self) -> None:
         self.main.grid(row=0, column=0, sticky="nsew")
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
+
         self.main.grid_columnconfigure(1, weight=1)
+
         self.header.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+        # URL row
         self.url_label.grid(row=1, column=0, sticky="w")
         self.url_entry.grid(row=1, column=1, sticky="ew", padx=(8, 8))
         self.convert_btn.grid(row=1, column=2, sticky="e")
-        self.progress.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 6))
-        self.status_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        self.log.grid(row=4, column=0, columnspan=2, sticky="nsew")
-        self.log_scroll.grid(row=4, column=2, sticky="nsw")
-        self.main.grid_rowconfigure(4, weight=1)
+
+        # NEW: format row
+        self.format_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.format_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
+
+        self.progress.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+        self.status_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        self.log.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        self.log_scroll.grid(row=5, column=2, sticky="nsw")
+        self.main.grid_rowconfigure(5, weight=1)
 
     def on_convert_clicked(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -76,14 +111,23 @@ class App(tk.Tk):
             messagebox.showwarning("Missing URL", "Please paste a YouTube URL first.")
             return
 
+        fmt_label = self.format_combo.get()
+        output_format: OutputFormat = self._format_label_to_value.get(fmt_label, "best")  # type: ignore
+
         self._set_busy(True)
         self._set_progress(0.0)
         self._set_status("Starting…")
         self._append_log(f"URL: {url}")
-        self._worker = threading.Thread(target=self._download_worker, args=(url,), daemon=True)
+        self._append_log(f"Format: {fmt_label}")
+
+        self._worker = threading.Thread(
+            target=self._download_worker,
+            args=(url, output_format),
+            daemon=True,
+        )
         self._worker.start()
 
-    def _download_worker(self, url: str) -> None:
+    def _download_worker(self, url: str, output_format: OutputFormat) -> None:
         def status_cb(msg: str) -> None:
             self._events.put(UiEvent("status", msg))
 
@@ -96,7 +140,7 @@ class App(tk.Tk):
                 status_cb=status_cb,
                 progress_cb=progress_cb,
             )
-            result: DownloadResult = downloader.download_best_audio(url)
+            result: DownloadResult = downloader.download_audio(url, output_format=output_format)
             self._events.put(UiEvent("done", result))
         except Exception as e:
             self._events.put(UiEvent("error", str(e)))
@@ -110,7 +154,7 @@ class App(tk.Tk):
                 elif ev.kind == "progress":
                     self._set_progress(float(ev.payload))
                 elif ev.kind == "done":
-                    res: DownloadResult = ev.payload
+                    res: DownloadResult = ev.payload  # type: ignore
                     self._set_status(f"Saved: {res.file_path}")
                     self._append_log(f"✅ Saved: {res.file_path}")
                     self._set_busy(False)
@@ -138,5 +182,7 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
     def _set_busy(self, busy: bool) -> None:
-        self.convert_btn.configure(state=("disabled" if busy else "normal"))
-        self.url_entry.configure(state=("disabled" if busy else "normal"))
+        state = "disabled" if busy else "normal"
+        self.convert_btn.configure(state=state)
+        self.url_entry.configure(state=state)
+        self.format_combo.configure(state=("disabled" if busy else "readonly"))
