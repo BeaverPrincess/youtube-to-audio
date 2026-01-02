@@ -1,10 +1,22 @@
+# app/config.py
 from pathlib import Path
 import sys
+import os
 
 APP_TITLE = "YouTube → Audio"
-DEFAULT_OUTPUT_DIR = Path("downloads")
 WINDOW_MIN_SIZE = (640, 420)
 POLL_MS = 100
+
+OUTPUT_SUBDIR_NAME = "downloaded_audios"
+
+# Default base folder for saving
+# Prefer Windows Downloads if it exists fallback to home.
+def _default_save_root() -> Path:
+    home = Path.home()
+    downloads = home / "Downloads"
+    return downloads if downloads.exists() else home
+
+DEFAULT_SAVE_ROOT = _default_save_root()
 
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys.executable).parent

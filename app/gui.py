@@ -1,20 +1,23 @@
+# app/gui.py
 from __future__ import annotations
 
 import threading
 import queue
 from dataclasses import dataclass
+from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from .config import (
     APP_TITLE,
-    DEFAULT_OUTPUT_DIR,
     WINDOW_MIN_SIZE,
     POLL_MS,
     OUTPUT_FORMATS,
     DEFAULT_OUTPUT_FORMAT,
+    OUTPUT_SUBDIR_NAME,
 )
 from .downloader import AudioDownloader, DownloadResult, OutputFormat
+from .settings import load_settings, save_settings, AppSettings
 
 
 @dataclass
@@ -31,9 +34,50 @@ class App(tk.Tk):
 
         self._events: "queue.Queue[UiEvent]" = queue.Queue()
         self._worker: threading.Thread | None = None
+
+        # NEW: settings (persistent)
+        self.settings: AppSettings = load_settings()
+
         self._build_widgets()
         self._layout_widgets()
+
+        # Ensure output dir exists at startup
+        self._ensure_output_dir()
+
         self.after(POLL_MS, self._poll_events)
+
+    # ---------- Output directory handling ----------
+
+    def _get_output_dir(self) -> Path:
+        # Always save into <save_root>/downloaded_audios
+        return Path(self.settings.save_root) / OUTPUT_SUBDIR_NAME
+
+    def _ensure_output_dir(self) -> None:
+        out_dir = self._get_output_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _choose_save_root(self) -> None:
+        if self._worker and self._worker.is_alive():
+            messagebox.showinfo("Busy", "Please wait for the current download to finish.")
+            return
+
+        initial = str(self.settings.save_root) if self.settings.save_root else str(Path.home())
+        chosen = filedialog.askdirectory(title="Choose save location", initialdir=initial)
+
+        if not chosen:
+            return
+
+        self.settings.save_root = Path(chosen)
+        save_settings(self.settings)
+
+        # Create downloaded_audios inside the new location
+        self._ensure_output_dir()
+
+        self.save_path_var.set(str(self._get_output_dir()))
+        self._append_log(f"📁 Save location set to: {self._get_output_dir()}")
+        self._set_status("Save location updated.")
+
+    # ---------- UI ----------
 
     def _build_widgets(self) -> None:
         self.main = ttk.Frame(self, padding=12)
@@ -49,11 +93,10 @@ class App(tk.Tk):
         self.url_entry = ttk.Entry(self.main, textvariable=self.url_var)
         self.url_entry.focus_set()
 
-        # NEW: output format dropdown
+        # Output format dropdown
         self.format_label = ttk.Label(self.main, text="Format:")
         self.format_var = tk.StringVar(value=DEFAULT_OUTPUT_FORMAT)
 
-        # Map label -> internal value
         self._format_label_to_value = {label: value for (label, value) in OUTPUT_FORMATS}
         self._format_value_to_label = {value: label for (label, value) in OUTPUT_FORMATS}
 
@@ -63,6 +106,16 @@ class App(tk.Tk):
             values=[label for (label, _v) in OUTPUT_FORMATS],
         )
         self.format_combo.set(self._format_value_to_label[DEFAULT_OUTPUT_FORMAT])
+
+        # NEW: Save location row
+        self.save_label = ttk.Label(self.main, text="Save to:")
+        self.save_path_var = tk.StringVar(value=str(self._get_output_dir()))
+        self.save_path_entry = ttk.Entry(
+            self.main,
+            textvariable=self.save_path_var,
+            state="readonly",
+        )
+        self.choose_btn = ttk.Button(self.main, text="Choose…", command=self._choose_save_root)
 
         self.convert_btn = ttk.Button(self.main, text="Download", command=self.on_convert_clicked)
 
@@ -90,16 +143,23 @@ class App(tk.Tk):
         self.url_entry.grid(row=1, column=1, sticky="ew", padx=(8, 8))
         self.convert_btn.grid(row=1, column=2, sticky="e")
 
-        # NEW: format row
+        # Format row
         self.format_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
         self.format_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
 
-        self.progress.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 6))
-        self.status_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        # NEW: Save row
+        self.save_label.grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.save_path_entry.grid(row=3, column=1, sticky="ew", padx=(8, 8), pady=(8, 0))
+        self.choose_btn.grid(row=3, column=2, sticky="e", pady=(8, 0))
 
-        self.log.grid(row=5, column=0, columnspan=2, sticky="nsew")
-        self.log_scroll.grid(row=5, column=2, sticky="nsw")
-        self.main.grid_rowconfigure(5, weight=1)
+        self.progress.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 6))
+        self.status_label.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        self.log.grid(row=6, column=0, columnspan=2, sticky="nsew")
+        self.log_scroll.grid(row=6, column=2, sticky="nsw")
+        self.main.grid_rowconfigure(6, weight=1)
+
+    # ---------- Actions ----------
 
     def on_convert_clicked(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -114,20 +174,24 @@ class App(tk.Tk):
         fmt_label = self.format_combo.get()
         output_format: OutputFormat = self._format_label_to_value.get(fmt_label, "best")  # type: ignore
 
+        # Ensure dir exists right before starting (in case user deleted it)
+        self._ensure_output_dir()
+
         self._set_busy(True)
         self._set_progress(0.0)
         self._set_status("Starting…")
         self._append_log(f"URL: {url}")
         self._append_log(f"Format: {fmt_label}")
+        self._append_log(f"Save to: {self._get_output_dir()}")
 
         self._worker = threading.Thread(
             target=self._download_worker,
-            args=(url, output_format),
+            args=(url, output_format, self._get_output_dir()),
             daemon=True,
         )
         self._worker.start()
 
-    def _download_worker(self, url: str, output_format: OutputFormat) -> None:
+    def _download_worker(self, url: str, output_format: OutputFormat, out_dir: Path) -> None:
         def status_cb(msg: str) -> None:
             self._events.put(UiEvent("status", msg))
 
@@ -136,7 +200,7 @@ class App(tk.Tk):
 
         try:
             downloader = AudioDownloader(
-                out_dir=DEFAULT_OUTPUT_DIR,
+                out_dir=out_dir,
                 status_cb=status_cb,
                 progress_cb=progress_cb,
             )
@@ -185,4 +249,5 @@ class App(tk.Tk):
         state = "disabled" if busy else "normal"
         self.convert_btn.configure(state=state)
         self.url_entry.configure(state=state)
+        self.choose_btn.configure(state=state)
         self.format_combo.configure(state=("disabled" if busy else "readonly"))
